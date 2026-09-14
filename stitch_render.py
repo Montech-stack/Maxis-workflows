@@ -146,11 +146,24 @@ def qc_check(path: str, retries: int = 6, retry_delay: float = 5.0) -> tuple[boo
                 result = subprocess.run(
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=width,height,codec_name",
-                     "-of", "csv=p=0", path],
+                     "-of", "default=noprint_wrappers=1", path],
                     capture_output=True, text=True,
                 )
-                parts = result.stdout.strip().split(",")
-                if len(parts) < 3 or not parts[0].isdigit():
+                # key=value output, not positional CSV — confirmed live this
+                # run (2026-09-14): ffprobe's csv=p=0 output for this exact
+                # field list came back as "h264,1080,1920" (codec_name FIRST),
+                # not the requested "width,height,codec_name" order, so
+                # parts[0].isdigit() rejected a perfectly valid 1080x1920
+                # video every single retry. Parsing by key instead of
+                # position can never be broken by ffprobe's actual field
+                # ordering again.
+                fields: dict[str, str] = {}
+                for line in result.stdout.strip().splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        fields[k] = v
+                width_s, height_s, codec = fields.get("width"), fields.get("height"), fields.get("codec_name")
+                if not width_s or not height_s or not codec or not width_s.isdigit() or not height_s.isdigit():
                     last_reason = "final video has no readable video stream"
                     try:
                         st = os.stat(path)
@@ -162,7 +175,7 @@ def qc_check(path: str, retries: int = 6, retry_delay: float = 5.0) -> tuple[boo
                         f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r} {size_mtime}"
                     )
                 else:
-                    width, height, codec = int(parts[0]), int(parts[1]), parts[2]
+                    width, height = int(width_s), int(height_s)
                     if width < 480 or height < 480:
                         last_reason = f"final video resolution too small ({width}x{height})"
                     else:
