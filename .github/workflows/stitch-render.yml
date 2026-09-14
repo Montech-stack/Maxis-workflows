@@ -1,0 +1,63 @@
+name: Stitch Render (Maxis Film Pipeline)
+
+# Runs stitch_render.py — the Maxis film pipeline's ffmpeg
+# download/normalize/concat/QC steps — on a GitHub-hosted runner instead
+# of the Browsight VPS (a single-vCPU/3.3GB KVM instance that was
+# starving on this exact workload: 125s+ concat times, swap spiking to
+# 9GB, while also running Chrome/Playwright for Flow browser automation).
+#
+# This is a separate, public repo (not Maxis-media, which is private)
+# specifically so this workload gets unlimited free Actions minutes
+# without exposing Maxis's actual product source — this repo contains
+# only the standalone ffmpeg render worker, nothing proprietary.
+#
+# The finished video is uploaded back to Browsight over HTTPS via its
+# existing presigned-upload pair (api_storage_presign /
+# api_storage_direct_upload in Browsight's dashboard/app.py) so storage
+# stays exactly where it already is.
+#
+# Triggered by Maxis-media's lib/github-dispatch.ts
+# (triggerStitchRenderWorkflow), called from
+# app/api/create/stitch-film/route.ts.
+
+on:
+  repository_dispatch:
+    types: [stitch-render-job]
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID to render"
+        required: true
+
+jobs:
+  stitch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg + caption font
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      - name: Install Python deps
+        run: pip install -q requests edge-tts
+
+      - name: Run stitch
+        env:
+          VIDEO_ID: ${{ github.event.client_payload.video_id || github.event.inputs.video_id }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BROWSIGHT_UPLOAD_URL: ${{ secrets.BROWSIGHT_URL }}
+          BROWSIGHT_API_KEY: ${{ secrets.BROWSIGHT_API_KEY }}
+        run: |
+          python stitch_render.py \
+            --video-id "$VIDEO_ID" \
+            --supabase-url "$SUPABASE_URL" \
+            --supabase-key "$SUPABASE_SERVICE_ROLE_KEY"
