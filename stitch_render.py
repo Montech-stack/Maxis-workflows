@@ -243,35 +243,42 @@ def mix_tracks(tracks: list[tuple[str, float]], out_path: str, duration: float):
 
 
 def image_to_video(image_path: str, audio_path: str | None, duration: float,
-                   out_path: str, is_portrait: bool, variant: int = 0):
+                   out_path: str, is_portrait: bool, variant: int = 0, static: bool = False):
     w, h = (1080, 1920) if is_portrait else (1920, 1080)
     fps = 24
     frames = max(1, round(duration * fps))
-    v = variant % 4
-    if v == 0:
-        vf = (
-            f"scale=2400:-1,"
-            f"zoompan=z='min(zoom+0.0015,1.3)':d={frames}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
-        )
-    elif v == 1:
-        vf = (
-            f"scale=2400:-1,"
-            f"zoompan=z='if(eq(on,0),1.3,max(zoom-0.0015,1.0))':d={frames}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
-        )
-    elif v == 2:
-        vf = (
-            f"scale=2400:-1,"
-            f"zoompan=z='1.15':d={frames}:"
-            f"x='(iw-iw/zoom)*on/{max(frames-1,1)}':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
-        )
+    if static:
+        # Used for pre-composited frames (e.g. the split-slide layout) that
+        # are already exactly w×h with crisp text baked in — a Ken Burns
+        # zoom would blur that text as it scaled, so this just holds the
+        # frame still for the full duration instead.
+        vf = f"scale={w}:{h}"
     else:
-        vf = (
-            f"scale=2400:-1,"
-            f"zoompan=z='1.15':d={frames}:"
-            f"x='(iw-iw/zoom)*(1-on/{max(frames-1,1)})':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
-        )
+        v = variant % 4
+        if v == 0:
+            vf = (
+                f"scale=2400:-1,"
+                f"zoompan=z='min(zoom+0.0015,1.3)':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
+            )
+        elif v == 1:
+            vf = (
+                f"scale=2400:-1,"
+                f"zoompan=z='if(eq(on,0),1.3,max(zoom-0.0015,1.0))':d={frames}:"
+                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
+            )
+        elif v == 2:
+            vf = (
+                f"scale=2400:-1,"
+                f"zoompan=z='1.15':d={frames}:"
+                f"x='(iw-iw/zoom)*on/{max(frames-1,1)}':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
+            )
+        else:
+            vf = (
+                f"scale=2400:-1,"
+                f"zoompan=z='1.15':d={frames}:"
+                f"x='(iw-iw/zoom)*(1-on/{max(frames-1,1)})':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}"
+            )
     if audio_path:
         run_ffmpeg(
             "-loop", "1", "-i", image_path,
@@ -320,6 +327,50 @@ def _wrap_caption(text: str, max_chars: int = 28) -> str:
     if cur:
         lines.append(cur)
     return "\n".join(lines)
+
+
+# Split-slide explainer layout (video_template == "slides" in Maxis-media):
+# the slide's full text on the left half of the frame, its illustration
+# filling the right half. Built as a single composited still frame first,
+# then held static for the slide's full narration duration by the caller
+# (image_to_video with static=True) — no Ken Burns zoom, since zooming
+# crisp drawtext would blur it as the frame scaled.
+def build_slide_frame(illustration_path: str, slide_text: str, out_path: str, w: int, h: int):
+    half_w = w // 2
+    text_path = out_path + ".txt"
+    # Narrower max_chars than the bottom-caption wrap (28) since this column
+    # is half the frame width, not the full width.
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(_wrap_caption(slide_text, max_chars=18))
+
+    if _CAPTION_FONT:
+        text_layer = (
+            f"drawtext=textfile={text_path}:fontfile={_CAPTION_FONT}:"
+            f"fontcolor=white:fontsize=42:line_spacing=16:"
+            f"x=60:y=(h-text_h)/2"
+        )
+    else:
+        # No bold font on this box — still compose the illustration onto its
+        # half rather than failing the whole slide over a missing font.
+        text_layer = "null"
+
+    filter_complex = (
+        f"color=c=0x11131a:size={w}x{h}:d=1[bg];"
+        f"[0:v]scale={half_w}:{h}:force_original_aspect_ratio=increase,crop={half_w}:{h}[img];"
+        f"[bg][img]overlay=x={half_w}:y=0[composited];"
+        f"[composited]{text_layer}[out]"
+    )
+
+    try:
+        run_ffmpeg(
+            "-i", illustration_path,
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-frames:v", "1",
+            out_path,
+        )
+    finally:
+        os.unlink(text_path)
 
 
 def finalize_segment(
@@ -499,6 +550,7 @@ async def stitch_video(db: SupabaseVideos, video: dict):
     video_id = video["id"]
     scenes: list[dict] = video.get("scenes") or []
     is_portrait = (video.get("video_format") or "portrait") == "portrait"
+    is_slides_template = video.get("video_template") == "slides"
     film_settings = video.get("film_settings") or {}
     bg_music_url = film_settings.get("bg_music_url")
     bg_music_volume = (film_settings.get("bg_music_volume") if film_settings.get("bg_music_volume") is not None else 30) / 100.0
@@ -649,13 +701,33 @@ async def stitch_video(db: SupabaseVideos, video: dict):
                     silent_audio(effective_duration, final_audio)
 
                 raw = os.path.join(tmpdir, f"raw_{idx:03d}.mp4")
-                image_to_video(img_path, final_audio, effective_duration, raw, is_portrait, variant=idx)
-                finalize_segment(
-                    raw, seg_norm, is_portrait,
-                    caption_text=caption_text if captions_enabled else None,
-                    captions_style=captions_style,
-                    caption_ass_path=caption_ass_path,
-                )
+                slide_composited = False
+                if is_slides_template:
+                    # Text is already baked into the left half of the
+                    # composed frame below — burning it again via the normal
+                    # caption path would duplicate it, so that's suppressed
+                    # for this template regardless of captions_enabled.
+                    # This filter_complex has never run in production (no
+                    # ffmpeg available to test it before shipping) — falls
+                    # back to a normal full-frame image rather than failing
+                    # the whole render if the compositing itself breaks.
+                    try:
+                        slide_frame = os.path.join(tmpdir, f"slide_{idx:03d}.png")
+                        slide_w, slide_h = (1080, 1920) if is_portrait else (1920, 1080)
+                        build_slide_frame(img_path, dialogue, slide_frame, slide_w, slide_h)
+                        image_to_video(slide_frame, final_audio, effective_duration, raw, is_portrait, static=True)
+                        finalize_segment(raw, seg_norm, is_portrait)
+                        slide_composited = True
+                    except Exception as e:
+                        log.warning(f"  [{idx+1}/{len(approved)}] split-slide compositing failed ({e}), falling back to full-frame image")
+                if not slide_composited:
+                    image_to_video(img_path, final_audio, effective_duration, raw, is_portrait, variant=idx)
+                    finalize_segment(
+                        raw, seg_norm, is_portrait,
+                        caption_text=caption_text if captions_enabled else None,
+                        captions_style=captions_style,
+                        caption_ass_path=caption_ass_path,
+                    )
 
             segments.append(seg_norm)
             pct = 10 + int(70 * (idx + 1) / len(approved))
