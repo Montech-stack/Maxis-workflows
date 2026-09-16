@@ -503,6 +503,9 @@ def concat_segments(segment_paths: list[str], out_path: str, transition: float =
         _concat_hardcut(segment_paths, out_path)
 
 
+CHUNK_SIZE = 40 * 1024 * 1024  # 40MB — comfortably under Cloudflare's cap (see below)
+
+
 def save_final_video(local_path: str, video_id: str) -> str:
     """No AWS/S3 — this VPS IS the storage now (see clip_worker.py's
     identical rationale).
@@ -513,11 +516,17 @@ def save_final_video(local_path: str, video_id: str) -> str:
     - On a GitHub Actions runner (stitching moved there 2026-09-14 to get
       real multi-core CPU for the ffmpeg-heavy encode/concat steps, which
       this 1-vCPU VPS was starving on): there is no local media_store to
-      write into, so instead call Browsight's existing presigned-upload
-      pair (api_storage_presign / api_storage_direct_upload in app.py —
-      the same mechanism already used for large client-side video uploads
-      from the browser) to PUT the finished file back to this VPS over
-      HTTPS. Same bucket_path, same returned URL shape either way.
+      write into, so instead call Browsight's presigned CHUNKED-upload pair
+      (api_storage_presign_chunked / api_storage_direct_upload_chunked in
+      app.py) to PUT the finished file back to this VPS over HTTPS in
+      pieces. Confirmed live 2026-09-16: a single-request PUT of the whole
+      file hit a 413 from Cloudflare's edge (fronting this VPS via the
+      cloudflared tunnel) at ~100-120MB — a real limit enforced upstream of
+      this app entirely, independent of anything configured here, and a
+      multi-minute rendered video routinely exceeds it in one shot. Chunks
+      are sent serially and reassembled server-side in order before the
+      token is consumed. Same bucket_path, same returned URL shape either
+      way.
     """
     bucket_path = f"film/{video_id}/final.mp4"
     upload_url = os.environ.get("BROWSIGHT_UPLOAD_URL")
@@ -525,17 +534,30 @@ def save_final_video(local_path: str, video_id: str) -> str:
 
     if upload_url and api_key:
         presign = requests.post(
-            f"{upload_url.rstrip('/')}/api/storage/presign",
+            f"{upload_url.rstrip('/')}/api/storage/presign-chunked",
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             json={"key": bucket_path, "contentType": "video/mp4"},
             timeout=30,
         )
         presign.raise_for_status()
         put_url = presign.json()["uploadUrl"]
+
+        file_size = os.path.getsize(local_path)
+        index = 0
         with open(local_path, "rb") as f:
-            put = requests.put(put_url, data=f, timeout=300)
-        put.raise_for_status()
-        return put.json()["url"]
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                log.info(f"[{video_id}] Uploading chunk {index} ({len(chunk) / 1024 / 1024:.1f}MB, "
+                          f"file is {file_size / 1024 / 1024:.1f}MB total)")
+                put = requests.put(f"{put_url}?index={index}", data=chunk, timeout=300)
+                put.raise_for_status()
+                index += 1
+
+        complete = requests.post(f"{put_url}/complete", timeout=30)
+        complete.raise_for_status()
+        return complete.json()["url"]
 
     sys.path.insert(0, str(ROOT.parent / "dashboard"))
     import storage as media_storage
