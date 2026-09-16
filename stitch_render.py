@@ -330,20 +330,96 @@ def _wrap_caption(text: str, max_chars: int = 28) -> str:
 
 
 # Split-slide explainer layout (video_template == "slides" in Maxis-media):
-# Flow generates the complete image itself now — text baked in on one side,
-# illustration on the other, in a single generation (see buildScenePrompt in
-# Maxis-media) — so there is nothing left to composite here. This used to
-# build the frame itself (crop the "illustration" down to half-width, draw
-# its own text over the other half), which made sense when Browsight did
-# the compositing, but Maxis-media reverted to Flow doing it all in one
-# shot and this script was never updated to match. Confirmed live
-# 2026-09-16: still calling this on Flow's own already-two-column image
-# cropped it down to just its right half (revealing HALF of Flow's own
-# text column plus its own illustration, header included) and drew ANOTHER
-# text overlay in front of it — a visible 3-panel mess, not 2 clean halves.
-# See image_to_video's static=True path (no Ken Burns zoom, so Flow's own
-# crisp baked-in text doesn't blur) for how a slides-template scene is
-# actually handled now.
+# text on the left half of the frame, illustration filling the right half.
+#
+# Explicit instruction 2026-09-16: keep this overlay — Flow's OWN baked-in
+# text is sometimes wrong (confirmed live: dropped/garbled words, and
+# separately it was printing "THE LEFT HALF"/"THE RIGHT HALF" as literal
+# on-image titles) — so the left side always gets OUR accurately-drawn
+# text instead, regardless of what Flow put there. Only the illustration
+# (right side) comes from Flow's own image.
+#
+# The bug that made this look like 3 panels instead of 2 wasn't the
+# overlay itself — it was cropping Flow's image WRONG. Flow's img_path is
+# a full two-column image (it draws both sides in one generation now), so
+# the earlier version's scale-to-cover-then-crop-from-center grabbed a
+# slice straddling BOTH of Flow's own columns instead of cleanly cutting
+# at the real midpoint. Fixed by cropping exactly the right half of the
+# SOURCE image at its native resolution (crop=iw/2:ih:iw/2:0) before
+# scaling it to fit — verified visually against a real generated image
+# before shipping this.
+#
+# One drawtext filter per line (each its own textfile) rather than a
+# single textfile with embedded "\n" line breaks — confirmed live on
+# Browsight's own ffmpeg build that the literal newline character renders
+# as a visible tofu-box glyph at the end of every wrapped line; using the
+# same proven-safe approach here rather than risk the same bug on this
+# runner's ffmpeg.
+def build_slide_frame(illustration_path: str, slide_text: str, out_path: str, w: int, h: int):
+    half_w = w // 2
+    # Explicit instruction 2026-09-16: bigger/bolder, wrap wider so lines
+    # actually use the available column width instead of leaving most of
+    # it empty, shifted right a bit off the very edge. borderw adds a
+    # stroke around each glyph for extra visual weight on top of the font's
+    # own bold weight.
+    fontsize = 50
+    x_pos = 90
+    line_height = int(fontsize * 1.4)
+
+    lines = slide_text.split()
+    wrapped: list[str] = []
+    cur = ""
+    for word in lines:
+        candidate = f"{cur} {word}".strip()
+        if len(candidate) > 26 and cur:
+            wrapped.append(cur)
+            cur = word
+        else:
+            cur = candidate
+    if cur:
+        wrapped.append(cur)
+    if not wrapped:
+        wrapped = [slide_text]
+
+    total_h = len(wrapped) * line_height
+    start_y = (h - total_h) // 2
+
+    line_paths = [f"{out_path}.line{i}.txt" for i in range(len(wrapped))]
+    try:
+        for path, line in zip(line_paths, wrapped):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(line)
+
+        stages = [
+            f"color=c=0x11131a:size={w}x{h}:d=1[bg]",
+            f"[0:v]crop=iw/2:ih:iw/2:0,scale={half_w}:{h}[img]",
+            f"[bg][img]overlay=x={half_w}:y=0[c0]",
+        ]
+        for i, path in enumerate(line_paths):
+            y = start_y + i * line_height
+            src, dst = f"c{i}", "out" if i == len(line_paths) - 1 else f"c{i+1}"
+            if _CAPTION_FONT:
+                stages.append(
+                    f"[{src}]drawtext=textfile={path}:fontfile={_CAPTION_FONT}:"
+                    f"fontcolor=white:borderw=2:bordercolor=white:fontsize={fontsize}:x={x_pos}:y={y}[{dst}]"
+                )
+            else:
+                stages.append(f"[{src}]null[{dst}]")
+        filter_complex = ";".join(stages)
+
+        run_ffmpeg(
+            "-i", illustration_path,
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-frames:v", "1",
+            out_path,
+        )
+    finally:
+        for path in line_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def finalize_segment(
@@ -696,16 +772,29 @@ async def stitch_video(db: SupabaseVideos, video: dict):
                     silent_audio(effective_duration, final_audio)
 
                 raw = os.path.join(tmpdir, f"raw_{idx:03d}.mp4")
+                slide_composited = False
                 if is_slides_template:
-                    # img_path IS the finished slide already (Flow generated
-                    # the text+illustration together in one shot — see
-                    # buildScenePrompt in Maxis-media) — use it as-is. No Ken
-                    # Burns zoom (static=True) since panning/scaling would
-                    # blur Flow's own crisp baked-in text, and no caption
-                    # burn since that text is already visible in the image.
+                    # Draw OUR OWN accurate text over the left half rather
+                    # than trust whatever Flow put there — see
+                    # build_slide_frame's docstring for why, and for the
+                    # crop fix that keeps this at 2 clean panels instead of
+                    # 3. Falls through to the plain-image path below (still
+                    # static, no zoom — this is a slide, not a scene to pan
+                    # across) if compositing itself fails, rather than
+                    # losing the scene entirely.
+                    try:
+                        slide_frame = os.path.join(tmpdir, f"slide_{idx:03d}.jpg")
+                        slide_w, slide_h = (1080, 1920) if is_portrait else (1920, 1080)
+                        build_slide_frame(img_path, dialogue, slide_frame, slide_w, slide_h)
+                        image_to_video(slide_frame, final_audio, effective_duration, raw, is_portrait, static=True)
+                        finalize_segment(raw, seg_norm, is_portrait)
+                        slide_composited = True
+                    except Exception as e:
+                        log.warning(f"  [{idx+1}/{len(approved)}] split-slide compositing failed ({e}), falling back to plain image")
+                if not slide_composited and is_slides_template:
                     image_to_video(img_path, final_audio, effective_duration, raw, is_portrait, static=True)
                     finalize_segment(raw, seg_norm, is_portrait)
-                else:
+                elif not slide_composited:
                     image_to_video(img_path, final_audio, effective_duration, raw, is_portrait, variant=idx)
                     finalize_segment(
                         raw, seg_norm, is_portrait,
