@@ -606,13 +606,28 @@ def save_final_video(local_path: str, video_id: str) -> str:
 
         complete = requests.post(f"{put_url}/complete", timeout=30)
         complete.raise_for_status()
-        return complete.json()["url"]
+        return _versioned(complete.json()["url"])
 
     sys.path.insert(0, str(ROOT.parent / "dashboard"))
     import storage as media_storage
     with open(local_path, "rb") as f:
         media_storage.save_file(bucket_path, f.read())
-    return media_storage.local_url(bucket_path)
+    return _versioned(media_storage.local_url(bucket_path))
+
+
+def _versioned(url: str) -> str:
+    """Append a cache-busting query param so a re-render's URL is never
+    identical to a previous render's. Confirmed live 2026-09-16: this VPS's
+    /media/ route serves every file with Cache-Control: public,
+    max-age=86400 (24h), and a re-render always writes to the exact same
+    bucket_path (film/{video_id}/final.mp4) — so Cloudflare's edge (fronting
+    this VPS) kept serving whichever bytes it cached from the FIRST render
+    for up to a full day afterward, regardless of how many times the origin
+    file was overwritten. The download button/rendered_video_url pointing
+    at that unchanged path had no way to know the content underneath it had
+    changed. A version param makes every render's URL genuinely new, so
+    Cloudflare (and the browser) always treat it as a fresh fetch."""
+    return f"{url}?v={int(time.time())}"
 
 
 # ── Core stitch pipeline (identical logic to server/stitch_worker.py) ──────────
