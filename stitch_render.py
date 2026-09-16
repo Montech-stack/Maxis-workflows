@@ -330,47 +330,20 @@ def _wrap_caption(text: str, max_chars: int = 28) -> str:
 
 
 # Split-slide explainer layout (video_template == "slides" in Maxis-media):
-# the slide's full text on the left half of the frame, its illustration
-# filling the right half. Built as a single composited still frame first,
-# then held static for the slide's full narration duration by the caller
-# (image_to_video with static=True) — no Ken Burns zoom, since zooming
-# crisp drawtext would blur it as the frame scaled.
-def build_slide_frame(illustration_path: str, slide_text: str, out_path: str, w: int, h: int):
-    half_w = w // 2
-    text_path = out_path + ".txt"
-    # Narrower max_chars than the bottom-caption wrap (28) since this column
-    # is half the frame width, not the full width.
-    with open(text_path, "w", encoding="utf-8") as f:
-        f.write(_wrap_caption(slide_text, max_chars=18))
-
-    if _CAPTION_FONT:
-        text_layer = (
-            f"drawtext=textfile={text_path}:fontfile={_CAPTION_FONT}:"
-            f"fontcolor=white:fontsize=42:line_spacing=16:"
-            f"x=60:y=(h-text_h)/2"
-        )
-    else:
-        # No bold font on this box — still compose the illustration onto its
-        # half rather than failing the whole slide over a missing font.
-        text_layer = "null"
-
-    filter_complex = (
-        f"color=c=0x11131a:size={w}x{h}:d=1[bg];"
-        f"[0:v]scale={half_w}:{h}:force_original_aspect_ratio=increase,crop={half_w}:{h}[img];"
-        f"[bg][img]overlay=x={half_w}:y=0[composited];"
-        f"[composited]{text_layer}[out]"
-    )
-
-    try:
-        run_ffmpeg(
-            "-i", illustration_path,
-            "-filter_complex", filter_complex,
-            "-map", "[out]",
-            "-frames:v", "1",
-            out_path,
-        )
-    finally:
-        os.unlink(text_path)
+# Flow generates the complete image itself now — text baked in on one side,
+# illustration on the other, in a single generation (see buildScenePrompt in
+# Maxis-media) — so there is nothing left to composite here. This used to
+# build the frame itself (crop the "illustration" down to half-width, draw
+# its own text over the other half), which made sense when Browsight did
+# the compositing, but Maxis-media reverted to Flow doing it all in one
+# shot and this script was never updated to match. Confirmed live
+# 2026-09-16: still calling this on Flow's own already-two-column image
+# cropped it down to just its right half (revealing HALF of Flow's own
+# text column plus its own illustration, header included) and drew ANOTHER
+# text overlay in front of it — a visible 3-panel mess, not 2 clean halves.
+# See image_to_video's static=True path (no Ken Burns zoom, so Flow's own
+# crisp baked-in text doesn't blur) for how a slides-template scene is
+# actually handled now.
 
 
 def finalize_segment(
@@ -723,26 +696,16 @@ async def stitch_video(db: SupabaseVideos, video: dict):
                     silent_audio(effective_duration, final_audio)
 
                 raw = os.path.join(tmpdir, f"raw_{idx:03d}.mp4")
-                slide_composited = False
                 if is_slides_template:
-                    # Text is already baked into the left half of the
-                    # composed frame below — burning it again via the normal
-                    # caption path would duplicate it, so that's suppressed
-                    # for this template regardless of captions_enabled.
-                    # This filter_complex has never run in production (no
-                    # ffmpeg available to test it before shipping) — falls
-                    # back to a normal full-frame image rather than failing
-                    # the whole render if the compositing itself breaks.
-                    try:
-                        slide_frame = os.path.join(tmpdir, f"slide_{idx:03d}.png")
-                        slide_w, slide_h = (1080, 1920) if is_portrait else (1920, 1080)
-                        build_slide_frame(img_path, dialogue, slide_frame, slide_w, slide_h)
-                        image_to_video(slide_frame, final_audio, effective_duration, raw, is_portrait, static=True)
-                        finalize_segment(raw, seg_norm, is_portrait)
-                        slide_composited = True
-                    except Exception as e:
-                        log.warning(f"  [{idx+1}/{len(approved)}] split-slide compositing failed ({e}), falling back to full-frame image")
-                if not slide_composited:
+                    # img_path IS the finished slide already (Flow generated
+                    # the text+illustration together in one shot — see
+                    # buildScenePrompt in Maxis-media) — use it as-is. No Ken
+                    # Burns zoom (static=True) since panning/scaling would
+                    # blur Flow's own crisp baked-in text, and no caption
+                    # burn since that text is already visible in the image.
+                    image_to_video(img_path, final_audio, effective_duration, raw, is_portrait, static=True)
+                    finalize_segment(raw, seg_norm, is_portrait)
+                else:
                     image_to_video(img_path, final_audio, effective_duration, raw, is_portrait, variant=idx)
                     finalize_segment(
                         raw, seg_norm, is_portrait,
