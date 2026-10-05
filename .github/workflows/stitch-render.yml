@@ -52,12 +52,12 @@ jobs:
       - name: Run stitch
         env:
           VIDEO_ID: ${{ github.event.client_payload.video_id || github.event.inputs.video_id }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MAXIS_API_URL: ${{ secrets.MAXIS_API_URL }}
+          MAXIS_SERVICE_KEY: ${{ secrets.MAXIS_SERVICE_KEY }}
           BROWSIGHT_UPLOAD_URL: ${{ secrets.BROWSIGHT_URL }}
           BROWSIGHT_API_KEY: ${{ secrets.BROWSIGHT_API_KEY }}
         run: |
           python stitch_render.py \
             --video-id "$VIDEO_ID" \
-            --supabase-url "$SUPABASE_URL" \
-            --supabase-key "$SUPABASE_SERVICE_ROLE_KEY"
+            --maxis-api-url "$MAXIS_API_URL" \
+            --maxis-service-key "$MAXIS_SERVICE_KEY"

@@ -2,11 +2,10 @@
 Maxis Film Stitch — single-job runner (replaces AWS Lambda + the unused
 EC2 poll-loop design in server/stitch_worker.py in the Maxis repo).
 
-Dispatched on demand by the Browsight dashboard (app.py's
-/api/render/generate, mirroring api_clip_generate's pattern) with
---video-id/--supabase-url/--supabase-key passed per call — same
-credential-per-request convention every other Browsight job already uses,
-so nothing here needs standing Supabase credentials of its own.
+Dispatched via GitHub Actions (repository_dispatch) with
+--video-id/--maxis-api-url/--maxis-service-key passed per call as repo
+secrets — same credential-per-request convention every other Browsight
+job already uses, so nothing here needs standing credentials of its own.
 
 Does, for exactly one video:
   1. Downloads each approved scene (video clip or reference image)
@@ -45,30 +44,32 @@ log = logging.getLogger("stitch_render")
 EDGE_TTS_FALLBACK_VOICE = "en-US-AriaNeural"
 
 
-# ── Supabase (plain REST, no client library — matches clip_worker.py) ──────────
+# ── maxis-server (plain REST, no client library — matches clip_worker.py) ──────
+# Was raw Supabase PostgREST — dead since the video pipeline migrated to
+# this self-hosted Postgres-backed API; that Supabase project doesn't even
+# resolve anymore. Same class name/interface kept so every other call site
+# in this file (db.get()/db.update()/progress()/fail()) needed no changes.
 
 class SupabaseVideos:
     def __init__(self, url: str, key: str):
         self._url = url.rstrip("/")
         self._headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
+            "X-Service-Key": key,
             "Content-Type": "application/json",
         }
 
     def get(self, video_id: str) -> dict | None:
         r = requests.get(
-            f"{self._url}/rest/v1/videos?id=eq.{video_id}&select=*",
+            f"{self._url}/videos/{video_id}",
             headers=self._headers, timeout=30,
         )
         r.raise_for_status()
-        rows = r.json()
-        return rows[0] if rows else None
+        return r.json().get("video")
 
     def update(self, video_id: str, fields: dict):
         r = requests.patch(
-            f"{self._url}/rest/v1/videos?id=eq.{video_id}",
-            headers={**self._headers, "Prefer": "return=minimal"},
+            f"{self._url}/videos/{video_id}",
+            headers=self._headers,
             json=fields, timeout=30,
         )
         r.raise_for_status()
@@ -856,11 +857,11 @@ async def stitch_video(db: SupabaseVideos, video: dict):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--video-id", required=True)
-    p.add_argument("--supabase-url", required=True)
-    p.add_argument("--supabase-key", required=True)
+    p.add_argument("--maxis-api-url", required=True)
+    p.add_argument("--maxis-service-key", required=True)
     args = p.parse_args()
 
-    db = SupabaseVideos(args.supabase_url, args.supabase_key)
+    db = SupabaseVideos(args.maxis_api_url, args.maxis_service_key)
     video = db.get(args.video_id)
     if not video:
         print(json.dumps({"success": False, "error": "Video not found"}), flush=True)
